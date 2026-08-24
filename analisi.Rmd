@@ -1,0 +1,479 @@
+---
+title: "Analisi della politica monetaria nella zona euro"
+author: "Riccardo Baratto n° 2129899"
+output: 
+  bookdown::pdf_document2:
+    toc: true
+    number_sections: false
+    latex_engine: pdflatex
+    keep_tex: true
+documentclass: report
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+\chapter{Introduzione}
+Il presente report si propone di esaminare le interazioni tra la politica monetaria e le principali variabili macroeconomiche nell'area euro. L'analisi si focalizza sul tasso di interesse a breve termine(usato come proxy dello strumento di politica monetaria della BCE), tasso di inflazione e tasso di disoccupazione.
+Attraverso l'uso di modelli per serie storiche multivariate si cercherà di identificare se esiste una relazione di equilibrio di lungo periodo tra queste variabili e come shock inattesi nei tassi di interesse si trasmettano all'economia reale e ai prezzi.
+```{r librerie, echo=FALSE}
+library(vars)
+library(urca) 
+library(dynlm) 
+library(readr)     
+library(tidyverse) 
+library(lubridate) 
+library(xts)       
+library(tseries)
+library(gridExtra) 
+library(forecast)
+```
+
+\chapter{Caricamento e preparazione dei dati}
+I dati grezzi sono stati presi dal database FRED (Federal Reserve Economic Data). Le serie scelte sono di frequenza mensile e coprono l'intera eurozona.
+
+
+```{r load-files}
+dati_unemp_grezzi = read_csv(file.choose()) #LRHUTTTTEZM156S
+dati_int_grezzi = read_csv(file.choose()) #IR3TIB01EZM156N
+dati_inf_grezzi = read_csv(file.choose()) #CP0000EZ19M086NEST
+```
+
+\section{Preparazione dei dati}
+
+Per poter procedere all'analisi occorre pulire e uniformare le serie. In particolare si rinominano le variabili per una maggiore leggibilità e assicurarsi che le colonne temporali siano interpretate correttamente.
+```{r process-files}
+#Disoccupazione
+unemp_proc = dati_unemp_grezzi %>%
+  rename(
+    Date = "observation_date",
+    Value = "LRHUTTTTEZM156S"
+  ) %>%
+  mutate(
+    Date = as.Date(Date, format = "%Y-%m-%d") 
+  ) %>%
+  dplyr::select(Date, Value)
+rm(dati_unemp_grezzi)
+
+#Interesse
+int_proc = dati_int_grezzi %>%
+  rename(
+    Date = "observation_date",
+    Value = "IR3TIB01EZM156N"
+  ) %>%
+  mutate(
+    Date = as.Date(Date, format = "%Y-%m-%d") 
+  ) %>%
+  dplyr::select(Date, Value)
+rm(dati_int_grezzi)
+
+#Prezzi
+inf_proc = dati_inf_grezzi %>%
+  rename(
+    Date = "observation_date",
+    Value = "CP0000EZ19M086NEST"
+  ) %>%
+  mutate(
+    Date = as.Date(Date, format = "%Y-%m-%d") 
+  ) %>%
+  dplyr::select(Date, Value)
+rm(dati_inf_grezzi)
+```
+
+I dati sui prezzi sono forniti da FRED sotto forma di indice(HICP), è quindi necessario trasformarli in tasso di inflazione. Si calcola quindi l'inflazione Year-over-Year, che confronta il livello dei prezzi di un mese con lo stesso mese dell'anno precedente, eliminando così eventuali componenti di stagionalità mensile. 
+
+Poichè il periodo delle serie non combacia nella loro interezza e si "perde" il primo anno della serie relativa all'inflazione a causa del calcolo dell'inflazione Year-over-Year, si allineano i periodi delle serie.
+
+```{r create-xts-and-merge}
+unemp_xts = xts(unemp_proc$Value, order.by = unemp_proc$Date)
+int_xts = xts(int_proc$Value, order.by = int_proc$Date)
+inf_index_xts = xts(inf_proc$Value, order.by = inf_proc$Date) 
+inflation_yoy_xts = (inf_index_xts / lag.xts(inf_index_xts, k = 12) - 1) * 100
+data_merged_xts = merge(unemp_xts, int_xts, inflation_yoy_xts)
+colnames(data_merged_xts) = c("Unemployment", "InterestRate", "Inflation")
+data_clean_xts = na.omit(data_merged_xts)
+```
+
+Per valutare la capacità predittiva del modello si divide il dataset in due parti, train e test.
+
+La scelta di terminare il set di addestramento a Dicembre 2019 non è casuale, l'inizio del 2020 è segnato dall'inizio del COVID, un evento che rappresenta una rottura strutturale nelle serie storiche economiche. Questo permetterà, nella fase di previsione, di verificare se le relazioni stimate siano state in grado di reggere o meno all'urto degli shock del 2020-2022.
+
+```{r split-data}
+start_year = year(start(data_clean_xts))
+start_month = month(start(data_clean_xts))
+data_ts = ts(data_clean_xts, 
+              start = c(start_year, start_month), 
+              frequency = 12)
+train = window(data_ts, end = c(2019, 12))
+test = window(data_ts, start = c(2020, 1))
+Unemployment = train[, "Unemployment"]
+InterestRate = train[, "InterestRate"]
+Inflation = train[, "Inflation"]
+```
+
+\chapter{Analisi preliminari}
+Si inizia con l'ispezione grafica delle tre serie storiche.
+
+\section{Grafici serie storiche}
+
+```{r plot-series}
+par(mfrow = c(3, 1), mar = c(2, 4, 2, 1))
+plot(Unemployment, main = "Disoccupazione (Train)", ylab = "%")
+plot(InterestRate, main = "Tasso Interesse (Train)", ylab = "%")
+plot(Inflation, main = "Inflazione (Train)", ylab = "% (YoY)")
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2))
+```
+Osservando le serie, la prima cosa che si può notare è la forte inerzia della disoccupazione, che non mostra alcuna tendenza a tornare verso una media fissa, ma segue cicli molto lunghi. Interessante il punto di inversione tra il 2005 e il 2006, dopo la discesa nei primi anni 2000, la serie sembra "prendere fiato" prima di scivolare verso il minimo pre-crisi del 2007, per poi esplodere nel 2013.
+
+Per quanto riguarda i tassi di interesse, il grafico mostra chiaramente il cambio nella strategia della BCE. Dopo una fase di gestione ordinaria (2000-2008) con tassi intorno al 2-4%, il crollo post-Lehman è verticale e definitivo, portando la serie in un lunghissimo regime di "tassi zero" che caratterizza quasi metà del campione. Anche l'inflazione riflette queste fratture: stabile fino al 2008, subisce uno shock deflattivo nel 2009 e poi fatica terribilmente a rialzarsi, rimanendo schiacciata verso lo zero per gran parte degli anni successivi.
+
+L'analisi visiva sembra confermare la presenza di trend stocastici e rotture strutturali.
+
+\section{Grafici ACF e PACF}
+Prima dei test formali, si esaminano le funzioni di autocorrelazione e le funzioni di autocorrelazione parziale.
+```{r plot-acf}
+par(mfrow = c(3, 1), mar = c(2, 4, 2, 1))
+acf(Unemployment, main = "ACF Disoccupazione", lag.max = 36)
+acf(InterestRate, main = "ACF Tasso Interesse", lag.max = 36)
+acf(Inflation, main = "ACF Inflazione", lag.max = 36)
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2))
+```
+I grafici dell'ACF relativi alle serie mostrano un comportamento molto simile, un decadimento lento e le autocorrelazioni risultano essere significative per diversi lag, quindi, sembrano confermare l'ipotesi di non stazionarietà.
+```{r plot-pacf}
+par(mfrow = c(3, 1), mar = c(2, 4, 2, 1))
+pacf(Unemployment, main = "PACF Disoccupazione", lag.max = 36)
+pacf(InterestRate, main = "PACF Tasso Interesse", lag.max = 36)
+pacf(Inflation, main = "PACF Inflazione", lag.max = 36)
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2))
+```
+I grafici PACF sono coerenti con quanto visto dall'analisi ACF e sembrerebbero confermare la non stazionarietà, infatti tutte le serie mostrano un singolo picco positivo e significativo e le rimanenti autocorrelazioni diventano subito non significative.
+\chapter{Test della radice unitaria}
+
+\section{Test ADF}
+Per verificare la presenza di una radice unitaria si usa il Test Augmented Dickey-Fuller (ADF) con un livello di significatività di $\alpha = 0.05$ per testare la non stazionarietà.
+Verranno testati tre modelli, un modello con l'intercetta e trend lineare, un modello con solo l'intercetta e un modello senza componenti deterministiche.
+\subsection{Tasso di disoccupazione}
+```{r adf-unemp-trend}
+adf_unemp_trend = ur.df(Unemployment, type = "trend", lags = 12, selectlags = "BIC")
+summary(adf_unemp_trend)
+```
+Il test indica che il trend non è significativo, quindi si procede al test successivo rimuovendo il trend.
+```{r adf-unemp-drift}
+adf_unemp_drift = ur.df(Unemployment, type = "drift", lags = 12, selectlags = "BIC")
+summary(adf_unemp_drift)
+```
+Il test indica che il drift non è significativo, quindi si procede al test successivo rimuovendo il drift.
+```{r adf-unemp-none}
+adf_unemp_none = ur.df(Unemployment, type = "none", lags = 12, selectlags = "BIC")
+summary(adf_unemp_none)
+```
+Non potendo rifiutare $H_0$, si conferma che la serie ha una radice unitaria ed è quindi non stazionaria in livelli.
+
+\subsection{Tasso di interesse}
+```{r adf-int-trend}
+adf_int_trend = ur.df(InterestRate, type = "trend", lags = 12, selectlags = "BIC")
+summary(adf_int_trend)
+```
+Il test indica che il trend è non significativo, si scarta quindi il modello e si procede al test successivo rimuovendo il trend.
+```{r adf-int-drift}
+adf_int_drift = ur.df(InterestRate, type = "drift", lags = 12, selectlags = "BIC")
+summary(adf_int_drift)
+```
+Anche il drift risulta non essere significativo, si scarta quindi anche questo modello.
+
+```{r adf-int-none}
+adf_int_none = ur.df(InterestRate, type = "none", lags = 12, selectlags = "BIC")
+summary(adf_int_none)
+```
+Non potendo rifiutare $H_0$, si conferma che la serie ha una radice unitaria ed è quindi non stazionaria in livelli.
+\subsection{Tasso di inflazione}
+```{r adf-inf-trend}
+adf_inf_trend = ur.df(Inflation, type = "trend", lags = 12, selectlags = "BIC")
+summary(adf_inf_trend)
+```
+Il test risulta essere non significativo, quindi si può scartare il modello e passare al test successivo rimuovendo il trend.
+```{r adf-inf-drift}
+adf_inf_drift = ur.df(Inflation, type = "drift", lags = 12, selectlags = "BIC")
+summary(adf_inf_drift)
+```
+Il drift risulta essere non significativo, si procede quindi al test sulla serie, rimuovendo anche il drift.
+```{r adf-inf-none}
+adf_inf_drift = ur.df(Inflation, type = "none", lags = 12, selectlags = "BIC")
+summary(adf_inf_drift)
+```
+Non potendo rifiutare $H_0$, si conferma che la serie ha una radice unitaria ed è quindi non stazionaria in livelli.
+
+\section{Verifica differenza prima}
+Si verifica che la radice sia unica, testando le differenze prime.
+
+```{r adf-diff}
+summary(ur.df(diff(Unemployment), type="drift", lags=12, selectlags="BIC"))
+summary(ur.df(diff(InterestRate), type="drift", lags=12, selectlags="BIC"))
+summary(ur.df(diff(Inflation), type="drift", lags=12, selectlags="BIC"))
+```
+Tutte le serie in differenze prime risultano essere stazionarie, quindi sono I(1).
+
+
+\chapter{Test di cointegrazione}
+Dopo aver accertato tramite i test ADF che tutte le serie considerate sono integrate di ordine 1, si verifica l'esistenza di una relazione di equilibrio di lungo periodo tra di esse.
+
+
+\section{Identificazione dell'ordine dei ritardi (p)}
+Prima di eseguire il test di Johansen, si determina il numero ottimale di ritardi da includere nel sistema. 
+
+Per questa selezione viene utilizzata la funzione `VARselect`, che valuta diversi criteri d'informazione basati sul trade-off tra bontà di adattamento e parsimonia del modello:
+```{r varselect-johansen}
+v_select = VARselect(train)
+print(v_select$selection)
+p_scelto = v_select$selection["AIC(n)"]
+p_scelto
+```
+Tutti i criteri giungono alla conclusione che il p ottimale risulta essere 3.
+```{r johansen-test}
+vecm = ca.jo(train, 
+              K = p_scelto - 1, type = "trace", 
+                       ecdet = "const", spec = "transitory")
+summary(vecm)
+```
+Coerentemente con la selezione del lag effettuata, il test è stato configurato con K=2 e l'inclusione di una costante nella relazione di cointegrazione.
+
+Poiché il valore del test per $r=0$ (45.18) supera il valore critico al 5\% (34.91), rifiutiamo l'ipotesi di assenza di cointegrazione. Al contrario, non è possibile rifiutare $r \le 1$, confermando la presenza di un'unica relazione di cointegrazione ($r=1$) tra le variabili.
+
+\subsection{Interpretazione del Vettore di Cointegrazione ($\beta$)}
+Normalizzando il vettore rispetto all'inflazione, l'equazione di equilibrio che ne deriva è la seguente:
+\begin{equation}
+Inflation = -0.23 \cdot Unemployment + 0.09 \cdot InterestRate + 4.12
+\end{equation}
+
+L'analisi dei coefficienti suggerisce una dinamica coerente con la teoria economica:
+\begin{itemize}
+    \item \textbf{Disoccupazione (-0.23):} Il legame inverso conferma l'esistenza di una Curva di Phillips di lungo periodo, dove una maggiore disoccupazione agisce da freno sulla dinamica dei prezzi.
+    \item \textbf{Tasso di Interesse (+0.09):} Il segno positivo riflette la funzione di reazione della BCE, dove tassi più elevati si associano a una inflazione più alta.
+\end{itemize}
+
+\subsection{Analisi della Velocità di Aggiustamento ($\alpha$)}
+La matrice dei pesi $\alpha$ permette di definire il ruolo di ciascuna variabile nel ripristino dell'equilibrio:
+\begin{itemize}
+    \item \textbf{Inflazione (-0.0139):} È la variabile che guida la correzione dell'errore. Il segno negativo e il valore indicano che l'inflazione corregge circa l'1.4\% dello scostamento dall'equilibrio ogni mese.
+    \item \textbf{Tasso di Interesse (0.0009):} Il valore prossimo allo zero indica che il tasso di interesse non reagisce agli scostamenti dall'equilibrio di lungo periodo. Ciò conferma che la BCE agisce come una variabile trainante, imprimendo impulsi che costringono le altre variabili ad adattarsi nel tempo.
+\end{itemize}
+
+\chapter{Valutazione e diagnostica del VECM}
+
+Per poter testare la validità del VECM lo si trasforma nella sua rappresentazione VAR in livelli equivalente.
+
+```{r get-vecm-model}
+r_scelto = 1
+model_var = vec2var(vecm, r = r_scelto)
+```
+
+\section{Test dell'autocorrelazione seriale dei residui}
+
+Si controlla che i residui non siano correlati tramite il test di Portmanteau.
+
+```{r vecm-diag-serial}
+serial_test = serial.test(model_var, lags.pt = 12, type = "PT.asymptotic")
+print(serial_test)
+```
+
+Il test di Portmanteau segnala una presenza netta di autocorrelazione nei residui. In un contesto standard, questo indicherebbe un modello mal specificato, ma guardando la storia dell'area euro è difficile pensare che un modello lineare possa digerire la crisi del 2008 senza "sporcare" i residui.
+Per dimostrare che il problema è il dato e non il modello, si è diviso il campione in due finestre temporali più omogenee, il periodo pre-2006 e il decennio 2009-2019.
+
+\subsection{Analisi di robustezza dei sotto campioni}
+\subsubsection{Pre 2006}
+Per testare l'ipotesi che le rotture strutturali siano la causa del fallimento della diagnostica nel modello globale, è stato isolato un sotto-campione corrispondente alla fase della cosiddetta "Great Moderation" (fino a Dicembre 2005). Questo periodo è caratterizzato da una dinamica macroeconomica più stabile, precedente agli shock sistemici del 2008.
+Si inizia testando il periodo pre-crisi.
+```{r robustness-check-pre-2006}
+train_subsample_2005 = window(train, end = c(2005, 12))
+v_select_sub_2005 = VARselect(train_subsample_2005, lag.max = 12, type = "const")
+p_sub_2005 = v_select_sub_2005$selection["AIC(n)"]
+k_sub_2005 = p_sub_2005 - 1
+vecm_sub_2005 = ca.jo(train_subsample_2005, K = k_sub_2005, type = "trace", 
+                       ecdet = "const", spec = "transitory")
+model_var_sub_2005 = vec2var(vecm_sub_2005, r = r_scelto)
+serial_test_sub_2005 = serial.test(model_var_sub_2005, lags.pt = 12, type = "PT.asymptotic")
+print(serial_test_sub_2005)
+```
+
+In questo caso il modello vecm risulta essere ben specificato, sembra quindi che il il fallimento del test relativo all'intera serie si possa attribuire all'instabilità dovuta alla crisi del 2008.
+\subsubsection{2009-2019}
+Dopo aver verificato la stabilità del periodo pre-2006, l'analisi è stata estesa al periodo successivo alla fase acuta della crisi finanziaria, partendo dal 2009. Questo sotto-campione copre la fase di ripresa e il successivo regime di tassi nominali prossimi allo zero.
+```{r robustness-check-subsample}
+
+train_subsample = window(train, start = (2009))
+v_select_sub = VARselect(train_subsample, lag.max = 12, type = "const")
+p_sub = v_select_sub$selection["AIC(n)"]
+k_sub = p_sub - 1
+vecm_sub = ca.jo(train_subsample, K = k_sub, type = "trace", 
+                       ecdet = "const", spec = "transitory")
+model_var_sub = vec2var(vecm_sub, r = r_scelto)
+serial_test_sub = serial.test(model_var_sub, lags.pt = 12, type = "PT.asymptotic")
+print(serial_test_sub)
+```
+Questo risulato, insieme a quello del sotto campione pre-2006, conferma l'ipotesi di rottura strutturale.
+E' da notare come anche i p di entrambe le sotto serie risultato essere uguali a quella della serie normale, come anche il k.
+Si procederà quindi con il modello vecm(k=2) stimato sulla serie intera.
+\subsection{Sintesi}
+Il fatto che il modello passi i test diagnostici in entrambi i periodi di stabilità relativa (pre-2006 e 2009-2019), ma fallisca sul campione totale ($p-value < 2.2e-16$), dimostra che l'autocorrelazione globale non sembra essere dovuta a una cattiva scelta dei lag o delle variabili. Il problema risiede nell'instabilità dei parametri durante i momenti di shock estremo (2006-2008), che un modello lineare a coefficienti fissi non può catturare senza generare residui correlati.
+Nonostante il fallimento del test di Portmanteau sulla serie intera, l'analisi di robustezza "riabilita" il modello, poiché le relazioni tengono nei sottoperiodi, si decide di procedere con il VECM (K=2) stimato sulla serie intera, accettando l'autocorrelazione globale come un prodotto inevitabile delle crisi presenti nel campione.
+
+\section{Test di normalità dei residui}
+
+Per verificare se i residui seguono una distribuzione normale si utilizza il test di Jarque-Bera.
+
+```{r vecm-diag-normality}
+normality_test = normality.test(model_var)
+print(normality_test)
+```
+Come atteso, vista la presenza di crisi e di volatilità non costante all'interno delle serie, il test di Jarque-Bera rifiuta l'ipotesi di normalità.
+
+\section{Stabilità del modello}
+
+La stabilità viene verificata analizzando le radici del suo polinomio caratteristico. 
+```{r vecm-diag-stability}
+var_livelli = VAR(train, p = p_scelto, type = "const")
+print(roots(var_livelli))
+```
+L'analisi dei moduli delle radici del polinomio caratteristico conferma la stabilità del modello. In un sistema con tre variabili e un solo vettore di cointegrazione, ci si aspetta la presenza di due radici unitarie ($n-r=2$). I risultati mostrano infatti due radici molto prossime all'unità (0.9937 e 0.9740), che catturano la componente stocastica non stazionaria delle serie originali.
+
+\chapter{Causalità, IRF e FEVD}
+
+\section{Analisi della causalità}
+
+\subsection{Velocità di aggiustamento e causalità di lungo periodo}
+
+Si esamina la prima colonna della matrice dei pesi del test di Johansen. 
+
+```{r vecm-weights}
+vecm@W[, 1]
+```
+
+Dall'analisi della matrice $\alpha$ emerge che l'inflazione è l'unica che mostra un chiaro ruolo di correzione dinamica verso l'equilibrio. Esiste quindi una causalità di lungo periodo che va dai tassi e dalla disoccupazione verso l'inflazione. 
+
+I tassi interesse invece non reagiscono all'errore di equlibrio, confermando il loro ruolo di variabile di impulso che guida il sistema senza subirne passivamente il ritorno all'equilibrio.
+
+
+\section{Funzioni di impulso-risposta}
+
+Per simulare la trasmissione della politica monetaria, si genera delle IRF ortogonalizzate utilizzando la scomposizione di Cholesky. 
+```{r irf-analysis}
+irf_int = irf(model_var, 
+               impulse = "InterestRate", 
+               response = c("Inflation", "Unemployment"), 
+               n.ahead = 24, 
+               boot = TRUE, 
+               ortho = TRUE,
+               runs = 100)
+plot(irf_int)
+```
+Si osserva una reazione negativa e significativa dell'inflazione nei primi periodi, l'effetto raggiunge il suo picco massimo di contrazione intorno ai 4-6 mesi dopo lo shock iniziale. Verso il 20esimo mese l'effetto tende a riassorbirsi tornando verso lo zero, confermando la stabilità del sistema.
+La disoccupazione invece presenta una piccola flessione seguita da una stabilizzazione.
+
+
+\section{Scomposizione della varianza dell'errore}
+
+```{r fevd-analysis}
+fevd_results = fevd(model_var, n.ahead = 36)
+plot(fevd_results)
+```
+
+Si osserva che lo shock ai tassi di interesse spiega una quota crescente della varianza dell'inflazione, partendo da circa il $5%$ nel breve periodo e arrivando a superare il $20%$ verso il trentesimo mese. Questo indica che lo strumento monetario ha un impatto sostanziale e ritardato nel tempo sulla dinamica dei prezzi.
+La disoccupazione ha circa l'$85-90%$ della sua varianza spiegata dai propri shock, gli shock relativi ai tassi di interesse e all'inflazione hanno un peso marginale.
+Anche i tassi di interesse hanno la maggior parte della propria varianza spiegata dai propri shock.
+
+\chapter{Previsione VECM}
+
+Si calcolano ora le previsioni.
+
+```{r vecm-forecast}
+prev = predict(model_var, n.ahead = NROW(test))
+
+inflation_actual = test[, "Inflation"]
+forecast_vector = prev$fcst$Inflation[, "fcst"]
+inflation_prev_ts = ts(forecast_vector, 
+                          start = start(test), 
+                          frequency = frequency(test))
+plot(inflation_actual, 
+     type = "l", 
+     main = "Previsione Inflazione vs Dati Reali (Test Set)",
+     ylab = "% (YoY)",
+     ylim = range(c(inflation_actual, inflation_prev_ts))) 
+lines(inflation_prev_ts, col = "red", lty = 2) 
+legend("topleft", 
+       legend = c("Dati Reali (Test)", "Previsione VECM"), 
+       col = c("black", "red"), lty = c(1, 2))
+```
+Mentre la previsione del VECM rimane intorno al $2%$, i dati reali mostrano una impennata verticale verso il $10%$, questo accade poichè il modello è addestrato su un periodo relativamente stabile(ad eccezione della crisi del 2008) e non riesce a prevedere gli shock derivanti dal COVID e dalla crisi energetica.
+
+
+\chapter{Valutazione e confronto previsioni}
+
+L'analisi nel capitolo precedente ha mostrato come il modello VECM, calibrato su dati storici pre-2020, non è stato in grado di intercettare gli shock strutturali verificatosi nel periodo di test. Per valutare la reale capacità predittiva del sistema è possibile vedere se l'approccio multivariato offre prestazioni superiori rispetto a un modello puramente autoregressivo.
+
+A tal fine, si utilizza come benchmark un modello ARIMA.
+\section{Stima e previsione modello ARIMA}
+
+Si addestra il modello ARIMA univariato sui dati di training dell'inflazione.
+
+```{r arima-benchmark}
+fit_arima = auto.arima(train[, "Inflation"])
+print(fit_arima)
+fc_arima = forecast(fit_arima, h = NROW(test))
+arima_prev_ts = fc_arima$mean
+```
+L'algoritmo ha selezionato un modello ARIMA(1,1,0)(0,0,1)[12], questo indica che la serie è stata differenziata una volta(confermando la non stazionarietà trovata nei test ADF) e presenta una componente autoregressiva di primo ordine. Inoltre indica la presenza di una componente di media mobile stagionale a 12 mesi, suggerendo che l'inflazione nell'area euro risente di dinamiche cicliche annuali.
+
+\section{Confronto metriche di errore}
+
+Si calcolano e si confrontano le metriche di errore.
+```{r accuracy-comparison}
+acc_vecm = accuracy(inflation_prev_ts, inflation_actual)
+acc_arima = accuracy(arima_prev_ts, inflation_actual)
+performance_table = rbind(acc_vecm, acc_arima)
+rownames(performance_table) = c("VECM (Multivariato)", "ARIMA (Univariato)")
+print(performance_table[, c("RMSE", "MAE")])
+```
+
+Il modello VECM presenta valori di RMSE e MAE significativamente inferiori rispetto a quelli ottenuti dal modello ARIMA. 
+
+\section{Test di Diebold-Mariano}
+
+Per validare la superiorità del modello multivariato, si esegue il test di Diebold-Mariano.
+
+```{r dm-test}
+e_vecm = inflation_actual - inflation_prev_ts
+e_arima = inflation_actual - arima_prev_ts
+dm_test = dm.test(e_vecm, e_arima, h = 1, power = 2)
+print(dm_test)
+```
+Si rifiuta l'ipotesi nulla, esiste quindi una differenza significativa tra la capacità predittiva dei due modelli.
+Il segno negativo della statistica conferma che l'errore del primo modello è inferiore a quello del secondo, il valore assoluto superiore a 4 indica che la superiorità del VECM è robusta.
+\chapter{Conclusioni}
+Il presente report ha analizzato le dinamiche di trasmissione della politica monetaria nell'area euro nel periodo 1999-2019, estendendo l'indagine alla capacità predittiva del modello nel periodo di crisi 2020-2022. Attraverso un approccio basato sui modelli a correzione dell'errore (VECM), è stato possibile mappare i legami di breve e lungo periodo tra inflazione, disoccupazione e tassi di interesse.
+
+L'analisi preliminare ha confermato che le serie storiche considerate sono processi non stazionari integrati di ordine 1, rendendo necessaria la ricerca di un equilibrio di lungo periodo. Il test di cointegrazione di Johansen ha identificato una relazione stabile ($r=1$) che lega le tre variabili. Nonostante il modello globale abbia mostrato segni di autocorrelazione dovuti alle forti rotture strutturali nel periodo 2006-2008, l'analisi di robustezza sui sotto-campioni ha confermato la validità della specifica VECM adottata.
+
+Analizzando le funzione di risposta all'impulso e la scomposizione della varianza è stato possibile osservare che uno shock positivo ai tassi d'interesse produce una contrazione dell'inflazione. L'analisi della matrice di caricamento ha rivelato che l'inflazione è la variabile che garantisce il ritorno all'equilibrio del sistema, mentre i tassi di interesse agiscono come guida.
+
+Nonostante il modello non riesca a prevedere l'impennata inflazionistica del 2020 (a causa degli shock provocati dalla pandemia e dalla crisi energetica) riesce a prevedere meglio rispetto a un modello ARIMA, ottenendo metriche di errore inferiori(dimostrando quindi che l'inclusione di disoccupazione e tassi di interesse forniscono un vantaggio informativo superiore rispetto alla sola inflazione).
+
+Per testare la reale tenuta del modello VECM, è stata condotta una verifica 'out-of-sample' confrontando i valori predetti con i dati effettivamente osservati nel periodo 2020-2022. Al fine di dare una prospettiva ancora più ampia alla validazione, i risultati sono stati messi a confronto con le proiezioni ufficiali diffuse dalla BCE nel dicembre 2019.
+
+\begin{table}[h!]
+\centering
+\caption{Confronto Inflazione (\% YoY): Previsioni VECM vs Proiezioni BCE (2019) vs Dati Reali}
+\label{tab:confronto_previsioni}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Anno} & \textbf{Previsione VECM} & \textbf{Proiezione BCE (Dic 2019)} & \textbf{Dato Reale FRED} \\ \midrule
+2020 & 1.7 \% & 1.1\% & 0.3\%  \\
+2021 & 2.15\% & 1.4\% & 4.96\%  \\
+2022 & 2.36\% & 1.6\% & 10.62\%  \\
+\end{tabular}
+\end{table}
+
+Il confronto numerico mostra una 'miopia' condivisa tra le prevision del VECM stimato e le previsioni ufficiali. 
+
+Entrambi gli approcci non sono riusciti a prevedere l'inflazione del trienni 2020-2022. 
+
+In conclusione, il modello VECM si è dimostrato uno strumento robusto per l'analisi della stabilità dei prezzi nell'eurozona. Sebbene i modelli lineari mostrino limiti intrinsechi di fronte a degli shock senza precedenti.
